@@ -2,9 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from ultralytics.nn.modules.conv import Conv  # وارد کردن بلوک Conv استاندارد
+from ultralytics.nn.modules.conv import Conv  
 
-# تعریف داخلی CoordinateAttention
 class CoordinateAttention(nn.Module):
     def __init__(self, in_channels, reduction=32):
         super(CoordinateAttention, self).__init__()
@@ -31,7 +30,6 @@ class CoordinateAttention(nn.Module):
         return identity * a_h * a_w
 
 class AttentionGeneratorWithCA(nn.Module):
-    """تولیدکننده توجه فضایی برای ماژول DCF با استفاده از CA."""
     def __init__(self, in_channels, num_bases):
         super(AttentionGeneratorWithCA, self).__init__()
         self.feature_enhancer = CoordinateAttention(in_channels)
@@ -47,7 +45,6 @@ class AttentionGeneratorWithCA(nn.Module):
         return attention_weights
 
 class CADCF(nn.Module):
-    """ماژول نهایی CA-DCF برای یکپارچه‌سازی در YOLO."""
     def __init__(self, c1, c2, k=3, num_bases=4, init_with_gabor=True, *args, **kwargs):
         super().__init__()
         self.c_in = c1
