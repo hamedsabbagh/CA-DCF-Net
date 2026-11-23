@@ -1,0 +1,123 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from ultralytics.nn.modules.conv import Conv  
+
+class CoordinateAttention(nn.Module):
+    def __init__(self, in_channels, reduction=32):
+        super(CoordinateAttention, self).__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        mid_channels = max(8, in_channels // reduction)
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+        self.act = nn.SiLU()
+        self.conv_h = nn.Conv2d(mid_channels, in_channels, kernel_size=1, bias=False)
+        self.conv_w = nn.Conv2d(mid_channels, in_channels, kernel_size=1, bias=False)
+
+    def forward(self, x):
+        identity = x
+        b, c, h, w = x.size()
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.act(self.bn1(self.conv1(y)))
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+        return identity * a_h * a_w
+
+class AttentionGeneratorWithCA(nn.Module):
+   
+    def __init__(self, in_channels, num_bases):
+        super(AttentionGeneratorWithCA, self).__init__()
+        self.feature_enhancer = CoordinateAttention(in_channels)
+        self.weight_generator = nn.Sequential(
+            Conv(in_channels, in_channels // 4, 1),
+            nn.Conv2d(in_channels // 4, num_bases, kernel_size=1),
+            nn.Softmax(dim=1)
+        )
+
+    def forward(self, x):
+        enhanced_x = self.feature_enhancer(x)
+        attention_weights = self.weight_generator(enhanced_x)
+        return attention_weights
+
+
+class CADCF(nn.Module):
+    
+    def __init__(self, c1, c2, n=1,k=3, num_bases=8, init_with_gabor=True):
+        super().__init__()
+        self.c_in, self.c_out, self.k, self.num_bases = c1, c2, k, num_bases
+        self.padding = k // 2
+
+        
+        self.basis_conv = nn.Conv2d(
+            in_channels=c1, 
+            out_channels=c1 * num_bases, 
+            kernel_size=k, 
+            padding=self.padding, 
+            groups=c1, 
+            bias=False
+        )
+
+        if init_with_gabor and k % 2 == 1:
+            self._initialize_with_gabor()
+        else:
+         
+            nn.init.kaiming_normal_(self.basis_conv.weight, mode='fan_out', nonlinearity='relu')
+        
+        self.attention_generator = AttentionGeneratorWithCA(c1, num_bases)
+        self.output_conv = Conv(c1, c2, 1) if c1 != c2 else nn.Identity()
+
+    def _initialize_with_gabor(self):
+       
+        gabor_kernels = torch.empty(self.num_bases * self.c_in, 1, self.k, self.k)
+        for i in range(self.num_bases):
+           
+            theta = i * torch.pi / self.num_bases
+            kernel = np.zeros((self.k, self.k), dtype=np.float32)
+            sigma, lmbda, gamma = self.k / 4.0, self.k, 0.5
+            for x_pos in range(self.k):
+                for y_pos in range(self.k):
+                    x, y = x_pos - self.padding, y_pos - self.padding
+                    x_theta = x * np.cos(theta) + y * np.sin(theta)
+                    y_theta = -x * np.sin(theta) + y * np.cos(theta)
+                    gb = np.exp(-.5 * (x_theta**2 + gamma**2 * y_theta**2) / sigma**2) * np.cos(2 * np.pi * x_theta / lmbda)
+                    kernel[x_pos, y_pos] = gb
+            norm = np.sqrt(np.sum(kernel**2))
+            kernel = kernel / norm if norm > 1e-6 else np.zeros_like(kernel)
+            gabor_tensor = torch.from_numpy(kernel).unsqueeze(0).unsqueeze(0)
+            
+           
+            start_idx = i * self.c_in
+            end_idx = (i + 1) * self.c_in
+            # در nn.Conv2d با groups=c1، وزنها شکل (out_channels, 1, k, k) دارند.
+            gabor_kernels[start_idx:end_idx] = gabor_tensor.repeat(self.c_in, 1, 1, 1)
+
+        
+        self.basis_conv.weight = nn.Parameter(gabor_kernels)
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        
+      
+        attention_weights = self.attention_generator(x) # (B, num_bases, H, W)
+
+       
+        intermediate_outputs = self.basis_conv(x) # (B, c_in * num_bases, H, W)
+        
+       
+        intermediate_outputs = intermediate_outputs.view(b, self.c_in, self.num_bases, h, w).permute(0, 2, 1, 3, 4) # -> (B, num_bases, c_in, H, W)
+
+       
+        output = torch.sum(attention_weights.unsqueeze(2) * intermediate_outputs, dim=1) # (B, c_in, H, W)
+        
+        return self.output_conv(output)
+
+
+
+
+
